@@ -1,1 +1,1 @@
-# rag-task
+The system retrieves semantically relevant chunks from uploaded documents and uses them as grounding context for LLM generation, ensuring factual and document-specific answers.

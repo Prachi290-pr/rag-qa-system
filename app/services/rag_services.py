@@ -1,99 +1,98 @@
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer 
-import faiss
-import numpy as np 
-import pickle
 import os
+import pickle
+import numpy as np
+import faiss
+import google.generativeai as genai
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
 
-# Loading embedding model once
-model = SentenceTransformer("all-MiniLM-L6-v2")
+# Configure Gemini API
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY not found in environment variables.")
 
+genai.configure(api_key=api_key)
 
-# 1. Load PDF
+# Initialize models
+# Embedding model for converting text to vectors
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Generative model for answering questions
+gemini_model = genai.GenerativeModel("models/gemini-2.5-flash")  
+
 
 def load_pdf(file_path):
+    """Extracts text from a PDF file."""
     reader = PdfReader(file_path)
-    text=""
+    text = ""
 
     for page in reader.pages:
         page_text = page.extract_text()
-        if page_text: 
+        if page_text:
             text += page_text + "\n"
 
-    if text.strip() == "":
+    if not text.strip():
         raise ValueError("No extractable text found in PDF. Try another PDF.")
 
     return text
 
-# 2. Chunk Text
 
 def chunk_text(text, chunk_size=800, overlap=100):
-    chunks=[]
+    """Splits text into chunks with overlap."""
+    chunks = []
     start = 0
 
     while start < len(text):
         end = start + chunk_size
         chunk = text[start:end]
         chunks.append(chunk)
-
         start += chunk_size - overlap
 
     return chunks
 
 
-# 3. Create Embeddings
-
 def create_embeddings(chunks):
-    embeddings = model.encode(chunks)
-    return embeddings 
+    """Generates vector embeddings for a list of text chunks."""
+    return embedding_model.encode(chunks)
 
-
-# 4. Store in FAISS
 
 def store_in_faiss(embeddings):
+    """Stores embeddings in a FAISS index for similarity search."""
     dimension = embeddings.shape[1]
-
     index = faiss.IndexFlatL2(dimension)
     index.add(np.array(embeddings))
-
     return index
 
 
-
-# 5. FULL Ingestion Pipeline
-
 def ingest_document(file_path):
-
-    # Load text
+    """Full pipeline: Load PDF -> Chunk -> Embed -> Store in FAISS."""
+    # 1. Load text
     text = load_pdf(file_path)
 
-    # Chunk
+    # 2. Chunk text
     chunks = chunk_text(text)
 
-    # Embeddings 
+    # 3. Create embeddings
     embeddings = create_embeddings(chunks)
 
-    # Store in FAISS
+    # 4. Create FAISS index
     index = store_in_faiss(embeddings)
 
     return index, chunks
 
 
-# 6. Retrieval 
-
 def retrieve_chunks(query, index, chunks, top_k=2):
-    query_embedding = model.encode([query])
+    """Searches the FAISS index for the most relevant chunks."""
+    query_embedding = embedding_model.encode([query])
     distances, indices = index.search(query_embedding, top_k)
-
     return [chunks[i] for i in indices[0]]
 
 
-
-# 7. Save FAISS + Chunks 
-
 def save_index_and_chunks(index, chunks, save_path="data/index_store"):
-
+    """Saves the FAISS index and chunks to disk."""
     os.makedirs(save_path, exist_ok=True)
 
     # Save FAISS index
@@ -104,9 +103,10 @@ def save_index_and_chunks(index, chunks, save_path="data/index_store"):
         pickle.dump(chunks, f)
 
 
-# 8. Load FAISS
-
 def load_index_and_chunks(save_path="data/index_store"):
+    """Loads the FAISS index and chunks from disk."""
+    if not os.path.exists(f"{save_path}/faiss.index"):
+        return None, None
 
     index = faiss.read_index(f"{save_path}/faiss.index")
 
@@ -114,3 +114,34 @@ def load_index_and_chunks(save_path="data/index_store"):
         chunks = pickle.load(f)
 
     return index, chunks
+
+
+def generate_rag_answer(query, index, chunks, top_k=3):
+    """Retrieves context and uses Gemini to answer the user's question."""
+    
+    # 1. Retrieve relevant context
+    retrieved_chunks = retrieve_chunks(query, index, chunks, top_k=top_k)
+    context = "\n\n".join(retrieved_chunks)
+
+    # 2. Construct the prompt
+    prompt = f"""
+    You are a helpful AI assistant.
+
+    Answer the question using ONLY the context provided.
+    If the answer is not present in context, say:
+    "I could not find this information in the document."
+
+    --------------------
+    Context:
+    {context}
+    --------------------
+
+    Question:
+    {query}
+
+    Answer:
+    """
+
+    # 3. Generate response
+    response = gemini_model.generate_content(prompt)
+    return response.text
